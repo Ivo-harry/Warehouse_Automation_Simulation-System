@@ -26,7 +26,7 @@ ADJACENCY_CSV = 'adjacency_two_way.csv'     # File showing which nodes connect t
 AGV_NUMBR = 18                              # Set the number of AGVs
 arrival_time_seconds = 24                   # 24 seconds between orders, means 3600 orders for the day
 # arrival_time_seconds = 208.2              # 208.2 seconds between orders, means 415 orders per day
-SEED = 31122002                             # My Birthdat if you wonder from where it came 
+SEED = 31122002                             # My Birthday if you wonder from where it came 
 random.seed(SEED)                           # For salabim distributions and Python random
 np.random.seed(SEED)                        # For numpy-based selections
 
