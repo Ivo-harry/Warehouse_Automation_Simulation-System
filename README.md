@@ -4,7 +4,7 @@ A discrete-event simulation of an automated warehouse built with Python and `sal
 
 ## Project Goal
 
-The objective of this simulation is to evaluate warehouse performance under different operational and traffic-control configurations. Specifically, it measures order throughput, average order completion time, AGV travel distance, waiting times, and battery recharging behavior. It also compares two picking workflows:
+The objective of this simulation is to evaluate warehouse performance under different operational and traffic-control configurations. Specifically, it measures order throughput, average order completion time, AGV travel distance, waiting times, battery recharging behavior, aisle direction lock contention, reroutings, and deadlock resolution. It also compares two picking workflows:
 
 - **Standard Mode (`INNOVATION = False`):** An AGV arrives at an ASRS node and waits sequentially as items are picked from the shelves.
 - **Container Pre-Preparation Mode (`INNOVATION = True`):** As soon as an order enters the system, the relevant ASRS units begin picking items into temporary buffer containers in parallel with AGV travel, reducing transfer time at the node to a fixed 15-second handoff.
@@ -17,17 +17,18 @@ The objective of this simulation is to evaluate warehouse performance under diff
 - **Multi-Node Picking:** Items can be stored and picked at any of the 3 nodes within an aisle, with an ASRS unit registered to each active pickup node.
 
 ### Fleet, Routing & Traffic Control
-- **Fleet & Battery Management:** Configurable AGV fleet (default: 20 AGVs) moving at a constant speed (`2 m/s`) with distance-based battery discharge and decentralized charging triggered below a 45% threshold.
-- **Dynamic Congestion-Aware Routing:** AGVs replan their next hop at each node using a congestion-weighted Dijkstra algorithm. Intermediate ASRS nodes with active queues or en-route AGVs receive distance-equivalent penalties so pass-through traffic avoids busy aisles when alternative paths exist.
-- **Collision Avoidance & Overtaking:** Movement is discretized into micro-steps (`0.5s`) with bounding-box overlap checks (`AGV_SIZE + 4px`) to prevent vehicles from overlapping or passing through each other on the same lane.
-- **Side-Bay Queuing & Bypassing:** AGVs actively loading at an ASRS pull into the loading bay, and AGVs waiting at entry/exit nodes pull inward into the aisle. This keeps the vertical corridors clear so other AGVs can overtake and continue along their routes without unnecessary blocking.
+- **Fleet & Battery Management:** Configurable AGV fleet moving at a constant speed (`2 m/s`) with distance-based battery discharge and decentralized charging triggered below a low-battery threshold.
+- **Two-Way Navigation & Aisle Direction Locks:** Aisle and corridor connections between warehouse nodes (`1–60`) can be mirrored for two-way movement. Horizontal movement inside an aisle uses direction locks (`L->R` / `R->L`) so opposing AGVs do not enter a single-lane aisle head-on; AGVs wait for the direction to free up before entering, or reroute if they block another AGV.
+- **Dynamic Congestion-Aware Routing:** AGVs replan their next hop using a congestion-weighted Dijkstra algorithm that accounts for active ASRS queues, en-route AGVs, and directional/bottleneck penalties.
+- **Collision Avoidance & Deadlock Recovery:** Movement runs in `0.5s` micro-steps with bounding-box overlap checks (`AGV_SIZE + 4px`). When two AGVs stay mutually blocked past a timeout threshold, the AGV closer to the nearest aisle exit (or higher ID on ties/extended chains) reverses back to its starting node, releases its aisle lock, steps aside to an unobstructed neighbor—or ducks into the Drop-Off bay (`61`) when node `60` is gridlocked—and replans.
+- **Side-Bay Queuing & FIFO Rerouting:** AGVs pull into side-bays when an ASRS node is occupied so vertical corridors remain clear. When a side-bay at an entry/exit node is already occupied and an AGV arrives from the corridor, it can reroute via the aisle's middle node to queue behind existing vehicles in FIFO order.
+- **Diagnostics & Reporting:** `DeadlockMonitor` periodically flags any AGV stationary for extended periods and logs when it recovers, while `WarehouseStats` reports aisle lock wait counts/durations, entries after waiting, total and FIFO reroutings, and deadlocks cleared.
 
 ## Limitations & Assumptions
 
-- **One-Way Snake Constraints:** In a strict one-way snake graph, dynamic routing can only detour where alternative edges exist in `adjacency.csv` (such as vertical corridors or cross-column links). AGVs targeting even-numbered aisles still must traverse the preceding feeder aisle unless outer corridors or two-way aisle rules are added.
-- **Simplified Kinematics:** AGVs travel at a constant speed without modeling acceleration, deceleration, or turning radii.
+- **Simplified Kinematics:** AGVs travel at a constant speed without modeling acceleration, deceleration, or turning radii, and short side-bay/step-aside maneuvers use local interpolated steps.
 - **Instant Special-Node Transfers:** Travel between the Drop-off (`61`), Depot (`0`), and Charger (`62`) is modeled as zero-distance instant movement.
-- **Discretized Spatial Checks:** Collision avoidance relies on fixed `0.5s` micro-steps, which balances visual accuracy against runtime speed for long headless runs.
+- **Discretized Spatial Checks & Heuristic Deadlock Resolution:** Collision detection uses `0.5s` micro-steps and deadlock recovery relies on local step-aside/rerouting rules rather than global centralized path reservation, so heavy fleet density can still produce temporary queues or multi-AGV congestion chains before recovery triggers.
 - **Fallback Data:** If `warehouse_items.csv` is not present in the working directory, the script generates 1,000 synthetic items distributed across the 60 aisle nodes.
 
 ## How to Use
