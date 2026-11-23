@@ -1,23 +1,230 @@
+"""
+COMMENTS FOR IMPORVEMENT/DEVELOPMNT
+
+
+
+"""
 import salabim as sim
 import random
 import csv
 import numpy as np
 import pandas as pd
 
+# ===============================================================================
+# GLOBAL PARAMETERS - Main settings that control the entire simulation
+# ===============================================================================
 
-""""
-CURRENT IMPROVEMENT: ALL LOCATIONS HAVE ASRS AND CAN GENERATE ORDERS FROM
-CARS RESPECT THE BUNDARIES OF EACH OTHER, SO THEN THEY DO NOT COLLIDE WHEN TRAVELLING ON LANES OR WAITING FOR ONE ANOTHER
+INNOVATION = True                           # Switch between old method (False) and new container method (True)
+AGV_SPEED = 2                               # How fast AGVs move in meters per second
+MAX_CHARGE = 100                            # Full battery is 100%
+CHARGE_THRESHOLD = 45                       # AGVs need charging when battery drops below 45%
+CHARGE_RATE = 4.5 / 60                      # How fast batteries charge (4.5% per minute converted to per second)
+SIM_DURATION = 24 * 60 * 60                 # How long simulation runs (24 hours in seconds)
+CSV_FILE = 'warehouse_items.csv'            # File containing all warehouse items
+#ADJACENCY_CSV = 'adjacency.csv'             # File showing which nodes connect to which nodes -> SNAKE PATTERN
+ADJACENCY_CSV = 'adjacency_two_way.csv'     # File showing which nodes connect to which nodes -> ALLOWS FOR DOUBLE
+AGV_NUMBR = 18                              # Set the number of AGVs
+arrival_time_seconds = 24                   # 24 seconds between orders, means 3600 orders for the day
+# arrival_time_seconds = 208.2              # 208.2 seconds between orders, means 415 orders per day
+SEED = 31122002
+random.seed(SEED)                           # For salabim distributions and Python random
+np.random.seed(SEED)                        # For numpy-based selections
 
+NODE_CONGESTION_PENALTY = 100.0             # meters-equivalent per AGV currently at a node
+ASRS_QUEUE_PENALTY = 120.0                  # extra meters-equivalent per AGV queued at an ASRS
 
-PROBLEMS:
-NOW AGVS CAN BLOCK ACH OTHER ON THE EXIT AISLES, SUCH AS 1-6 OR 6-7 OR 7-12 OR 10-15.
-THIS NEEDS TO BE ADJUSTED BY MAKING SOME KIND OF WAITING COMMAND THAT ALLOWS OTHER AGS THAT NEED TO SIMPLY PASS, TO DO SO EASILY
+# ===============================================================================
+# ANIMATION SETTINGS - Controls how the warehouse looks on screen
+# ===============================================================================
 
+class AnimationConfig:
+    # Window size
+    WINDOW_WIDTH = 1600
+    WINDOW_HEIGHT = 950
 
-Python
+    # Layout measurements
+    AISLE_WIDTH = 400               # How wide each aisle appears
+    AISLE_HEIGHT = 30               # How tall each aisle appears
+    NODE_RADIUS = 12                # Size of dots representing locations
+    AGV_SIZE = 15                   # Size of AGV squares
+    FONT_SIZE = 10                  # Text size
+    AGV_TRAVEL_OFFSET = 25          # How far below aisles AGVs travel
+
+    # Where things are positioned
+    LEFT_COLUMN_X = 250             # X position of left aisles
+    RIGHT_COLUMN_X = 800            # X position of right aisles
+    AISLE_SPACING_Y = 55            # Vertical space between aisles
+    TOP_MARGIN = 80                 # Space from top of screen
+
+    # Colors for different things
+    AISLE_COLOR = "lightgray"
+    NODE_COLOR = "lightblue"
+    DEPOT_COLOR = "orange"          # Where AGVs start
+    DROPOFF_COLOR = "orange"        # Where AGVs deliver orders
+    CHARGER_COLOR = "darkgreen"     # Charging station
+    ASRS_ACTIVE_COLOR = "firebrick" # ASRS when working
+    ASRS_IDLE_COLOR = "orange"      # ASRS when not working
+    TEXT_COLOR = "black"
+
+    # AGV colors based on what they're doing
+    AGV_IDLE = "green"              # AGV waiting for work
+    AGV_MOVING = "orange"           # AGV traveling
+    AGV_PICKING = "red"             # AGV getting items
+    AGV_QUEUED = "orange"           # AGV waiting in line
+    AGV_CHARGING = "blue"           # AGV charging battery
+
+    # Container colors
+    CONTAINER_READY = "green"       # Container has items ready
+    CONTAINER_EMPTY = "orange"      # Container is empty
+
+# ===============================================================================
+# WAREHOUSE LAYOUT SETTINGS - Physical warehouse structure
+# ===============================================================================
+
+NUM_AISLES = 20                     # Total number of aisles in warehouse
+AISLE_LENGTH = 50                   # How long each aisle is in meters
+ENERGY_PER_METER = 0.042            # How much battery AGVs use per meter traveled
+
+# Special locations in warehouse
+DEPOT_NODE = 0                      # Where AGVs start and return to
+DROP_OFF_NODE = 61                  # Where AGVs deliver completed orders
+CHARGER_NODE = 62                   # Where AGVs go to charge batteries
+
+# ===============================================================================
+# WAREHOUSE SYSTEM - Main brain that coordinates everything
+# ===============================================================================
+
+class WarehouseSystem:
+    """Main coordinator for order states, ASRS units, AGVs, dispatcher, and aisle locks."""
+    def __init__(self):
+        self.order_states = {}
+        self.asrs_dict = {}
+        self.agv_list = []
+        self.dispatcher = None
+        # Direction locks per aisle to prevent head-on deadlocks in narrow 2-way aisles
+        self.aisle_locks = {
+            aisle: {'dir': None, 'count': 0}
+            for aisle in range(1, NUM_AISLES + 1)
+        }
+
+    def register_asrs(self, node, asrs):
+        self.asrs_dict[node] = asrs
+
+    def register_agv(self, agv):
+        self.agv_list.append(agv)
+
+    def register_dispatcher(self, dispatcher):
+        self.dispatcher = dispatcher
+
+    def can_enter_aisle(self, aisle_num, direction):
+        lock = self.aisle_locks[aisle_num]
+        return lock['count'] == 0 or lock['dir'] == direction
+
+    def enter_aisle(self, aisle_num, direction):
+        lock = self.aisle_locks[aisle_num]
+        if lock['count'] == 0:
+            lock['dir'] = direction
+        lock['count'] += 1
+
+    def leave_aisle(self, aisle_num):
+        lock = self.aisle_locks[aisle_num]
+        lock['count'] = max(0, lock['count'] - 1)
+        if lock['count'] == 0:
+            lock['dir'] = None
+
+    def can_start_preparation(self, order_id, node):
+        if order_id not in self.order_states:
+            self.order_states[order_id] = {}
+        current_state = self.order_states[order_id].get(node, 'not_started')
+        return current_state == 'not_started'
+
+    def set_order_state(self, order_id, node, state):
+        if order_id not in self.order_states:
+            self.order_states[order_id] = {}
+        self.order_states[order_id][node] = state
+        SimLogger.log(f"Order state changed to '{state}' at node {node}",
+                      order_id=order_id, component_type="WarehouseSystem")
+
+    def get_order_state(self, order_id, node):
+        return self.order_states.get(order_id, {}).get(node, 'not_started')
+
+    def cleanup_completed_order(self, order_id):
+        if order_id in self.order_states:
+            del self.order_states[order_id]
+
+warehouse_system = WarehouseSystem()
+
+# ===============================================================================
+# COORDINATE SYSTEM - Converts node numbers to screen positions
+# ===============================================================================
+
+def get_node_coordinates(node_number):
+    """Convert a node number to x,y coordinates on screen."""
+    if node_number == DEPOT_NODE:
+        return (AnimationConfig.RIGHT_COLUMN_X - AnimationConfig.AISLE_WIDTH // 2, 30)
+    elif node_number == DROP_OFF_NODE:
+        return (AnimationConfig.LEFT_COLUMN_X + AnimationConfig.AISLE_WIDTH // 2, 30)
+    elif node_number == CHARGER_NODE:
+        return ((AnimationConfig.RIGHT_COLUMN_X - AnimationConfig.AISLE_WIDTH // 2 +
+                 AnimationConfig.LEFT_COLUMN_X + AnimationConfig.AISLE_WIDTH // 2) // 2, 30)
+    else:
+        aisle_num = ((node_number - 1) // 3) + 1
+        position_in_aisle = (node_number - 1) % 3  # 0=entry, 1=middle, 2=exit
+
+        if aisle_num <= NUM_AISLES // 2:  # Right column (aisles 1-10)
+            base_x = AnimationConfig.RIGHT_COLUMN_X
+            base_y = AnimationConfig.TOP_MARGIN + (aisle_num - 1) * AnimationConfig.AISLE_SPACING_Y
+        else:  # Left column (aisles 11-20)
+            base_x = AnimationConfig.LEFT_COLUMN_X
+            base_y = AnimationConfig.TOP_MARGIN + (NUM_AISLES - aisle_num) * AnimationConfig.AISLE_SPACING_Y
+
+        if aisle_num <= NUM_AISLES // 2:
+            if aisle_num % 2 == 1:  # Odd aisles (1, 3, 5, 7, 9): LEFT TO RIGHT
+                if position_in_aisle == 0:
+                    return (base_x - AnimationConfig.AISLE_WIDTH // 2, base_y)
+                elif position_in_aisle == 1:
+                    return (base_x, base_y)
+                else:
+                    return (base_x + AnimationConfig.AISLE_WIDTH // 2, base_y)
+            else:  # Even aisles (2, 4, 6, 8, 10): RIGHT TO LEFT
+                if position_in_aisle == 0:
+                    return (base_x + AnimationConfig.AISLE_WIDTH // 2, base_y)
+                elif position_in_aisle == 1:
+                    return (base_x, base_y)
+                else:
+                    return (base_x - AnimationConfig.AISLE_WIDTH // 2, base_y)
+        else:
+            if aisle_num % 2 == 1:  # Odd aisles (11, 13, 15, 17, 19): RIGHT TO LEFT
+                if position_in_aisle == 0:
+                    return (base_x + AnimationConfig.AISLE_WIDTH // 2, base_y)
+                elif position_in_aisle == 1:
+                    return (base_x, base_y)
+                else:
+                    return (base_x - AnimationConfig.AISLE_WIDTH // 2, base_y)
+            else:  # Even aisles (12, 14, 16, 18, 20): LEFT TO RIGHT
+                if position_in_aisle == 0:
+                    return (base_x - AnimationConfig.AISLE_WIDTH // 2, base_y)
+                elif position_in_aisle == 1:
+                    return (base_x, base_y)
+                else:
+                    return (base_x + AnimationConfig.AISLE_WIDTH // 2, base_y)
+
+def get_aisle_and_direction(from_node, to_node):
+    """Return (aisle_num, direction) if moving horizontally within the same aisle, else (None, None)."""
+    if not (1 <= from_node <= 60 and 1 <= to_node <= 60):
+        return None, None
+    aisle_from = ((from_node - 1) // 3) + 1
+    aisle_to = ((to_node - 1) // 3) + 1
+    if aisle_from != aisle_to:
+        return None, None
+    x1, _ = get_node_coordinates(from_node)
+    x2, _ = get_node_coordinates(to_node)
+    if x2 == x1:
+        return None, None
+    return aisle_from, ('L->R' if x2 > x1 else 'R->L')
+
 def get_asrs_queue_position(node_number, queue_index=0):
-Return (x, y) pulled inside the aisle so queued AGVs don't block the vertical corridor.
+    """Return (x, y) pulled inside the aisle so queued AGVs don't block the vertical corridor."""
     node_x, node_y = get_node_coordinates(node_number)
     lane_y = node_y - AnimationConfig.AGV_TRAVEL_OFFSET
 
@@ -35,257 +242,13 @@ Return (x, y) pulled inside the aisle so queued AGVs don't block the vertical co
     slot_spacing = AnimationConfig.AGV_SIZE + 4
 
     if node_x < base_x:
-        # Left end of aisle (e.g., nodes 1, 6, 7, 12) -> pull right into the aisle
         wait_x = node_x + pull_in_offset + queue_index * slot_spacing
     elif node_x > base_x:
-        # Right end of aisle (e.g., nodes 3, 4, 9, 10, 55, 60) -> pull left into the aisle
         wait_x = node_x - pull_in_offset - queue_index * slot_spacing
     else:
-        # Middle node (e.g., nodes 2, 5, 8) -> stay in place
         wait_x = node_x
 
     return (wait_x, lane_y)
-2. Move the AGV into the waiting bay in AGV.process()
-Inside AGV.process(), update the if asrs: block right before asrs.enqueue_agv(self):
-
-Python
-                        asrs = next((a for a in asrs_list if a.node_number == target), None)
-                        if asrs:
-                            # Pull off the vertical corridor into the aisle waiting bay
-                            wait_x, wait_y = get_asrs_queue_position(target, asrs.agv_queue.length())
-                            self.cur_x, self.cur_y = wait_x, wait_y
-                            self.animation_object.x = wait_x
-                            self.animation_object.y = wait_y
-
-                            wait_start = env.now()
-                            asrs.enqueue_agv(self)
-                            self.passivate()
-                            wait_time = env.now() - wait_start
-                            self.total_waiting_time += wait_time
-How this behaves
-Side nodes (1, 3, 4, 6, ...): An AGV arriving while the ASRS is busy pulls 25px inside the aisle, leaving the vertical corridor open for other AGVs to pass.
-
-Multiple waiting AGVs: Each additional AGV lines up 19px further inside the aisle (queue_index * slot_spacing) so they don't overlap each other either.
-
-After pickup: loading_complete() returns the AGV to the travel lane (node_x, node_y - AGV_TRAVEL_OFFSET) to resume its route.
-
-
-2. Direction-locked aisles (Narrow single-lane aisles)
-Treat each aisle like a one-lane bridge with a direction lock and a counter:
-
-The first AGV entering an empty aisle locks it to its direction (L->R or R->L) and increments an active_count.
-
-Other AGVs going the same direction can enter and follow behind it.
-
-An AGV wanting the opposite direction must wait at the entry node until active_count == 0—or your dynamic Dijkstra sees the opposite-direction lock as a high penalty and routes it around.
-
-This prevents head-on deadlocks completely, though it adds waiting time at aisle entrances during peak traffic.
-
-
-"""
-
-# ===============================================================================
-# GLOBAL PARAMETERS - Main settings that control the entire simulation
-# ===============================================================================
-
-INNOVATION = True                  # Switch between old method (False) and new container method (True)
-AGV_SPEED = 2                       # How fast AGVs move in meters per second
-MAX_CHARGE = 100                    # Full battery is 100%
-CHARGE_THRESHOLD = 45               # AGVs need charging when battery drops below 45%
-CHARGE_RATE = 4.5 / 60              # How fast batteries charge (4.5% per minute converted to per second)
-SIM_DURATION = 24 * 60 * 60         # How long simulation runs (24 hours in seconds)
-CSV_FILE = 'warehouse_items.csv'    # File containing all warehouse items
-ADJACENCY_CSV = 'adjacency.csv'     # File showing which nodes connect to which nodes
-AGV_NUMBR = 10                      # Set the number of AGVs
-arrival_time_seconds = 17.3        # 17.3 seconds between orders,  means 5000 orders for the day
-#arrival_time_seconds = 208.2        # 208.2 seconds between orders, means 415 orders per day
-SEED = 31122002
-random.seed(SEED)                   # For salabim distributions and Python random
-np.random.seed(SEED)                # For numpy-based selections
-
-
-NODE_CONGESTION_PENALTY = 100.0   # meters-equivalent per AGV currently at a node
-ASRS_QUEUE_PENALTY = 120.0        # extra meters-equivalent per AGV queued at an ASRS
-
-# ===============================================================================
-# ANIMATION SETTINGS - Controls how the warehouse looks on screen
-# ===============================================================================
-
-class AnimationConfig:
-    # Window size
-    WINDOW_WIDTH = 1600
-    WINDOW_HEIGHT = 950
-
-    # Layout measurements
-    AISLE_WIDTH = 400  # How wide each aisle appears
-    AISLE_HEIGHT = 30  # How tall each aisle appears
-    NODE_RADIUS = 12  # Size of dots representing locations
-    AGV_SIZE = 15  # Size of AGV squares
-    FONT_SIZE = 10  # Text size
-    AGV_TRAVEL_OFFSET = 25  # How far below aisles AGVs travel
-
-    # Where things are positioned
-    LEFT_COLUMN_X = 250  # X position of left aisles
-    RIGHT_COLUMN_X = 800  # X position of right aisles
-    AISLE_SPACING_Y = 55  # Vertical space between aisles
-    TOP_MARGIN = 80  # Space from top of screen
-
-    # Colors for different things
-    AISLE_COLOR = "lightgray"
-    NODE_COLOR = "lightblue"
-    DEPOT_COLOR = "orange"  # Where AGVs start
-    DROPOFF_COLOR = "orange"  # Where AGVs deliver orders
-    CHARGER_COLOR = "darkgreen"  # Charging station
-    ASRS_ACTIVE_COLOR = "firebrick"  # ASRS when working
-    ASRS_IDLE_COLOR = "orange"  # ASRS when not working
-    TEXT_COLOR = "black"
-
-    # AGV colors based on what they're doing
-    AGV_IDLE = "green"  # AGV waiting for work
-    AGV_MOVING = "orange"  # AGV traveling
-    AGV_PICKING = "red"  # AGV getting items
-    AGV_QUEUED = "orange"  # AGV waiting in line
-    AGV_CHARGING = "blue"  # AGV charging battery
-
-    # Container colors
-    CONTAINER_READY = "green"  # Container has items ready
-    CONTAINER_EMPTY = "orange"  # Container is empty
-
-# ===============================================================================
-# WAREHOUSE LAYOUT SETTINGS - Physical warehouse structure
-# ===============================================================================
-
-NUM_AISLES = 20  # Total number of aisles in warehouse
-AISLE_LENGTH = 50  # How long each aisle is in meters
-ENERGY_PER_METER = 0.042  # How much battery AGVs use per meter traveled
-
-# Special locations in warehouse
-DEPOT_NODE = 0  # Where AGVs start and return to
-DROP_OFF_NODE = 61  # Where AGVs deliver completed orders
-CHARGER_NODE = 62  # Where AGVs go to charge batteries
-
-# ===============================================================================
-# WAREHOUSE SYSTEM - Main brain that coordinates everything
-# ===============================================================================
-
-class WarehouseSystem:
-    """
-    This is the main coordinator that keeps track of everything happening.
-    Think of it as the warehouse manager that knows:
-    - Which orders are being prepared where
-    - Which ASRS machines are available
-    - Which AGVs are working
-    - Who the dispatcher is
-    """
-    def __init__(self):
-        self.order_states = {}  # Tracks what's happening with each order at each location
-        self.asrs_dict = {}  # List of all ASRS machines and where they are
-        self.agv_list = []  # List of all AGVs
-        self.dispatcher = None  # The dispatcher that assigns work
-        # Order states can be: 'not_started', 'preparing', 'ready', 'transferred'
-
-    def register_asrs(self, node, asrs):
-        """Add an ASRS machine to our list so we know it exists"""
-        self.asrs_dict[node] = asrs
-
-    def register_agv(self, agv):
-        """Add an AGV to our list so we can track it"""
-        self.agv_list.append(agv)
-
-    def register_dispatcher(self, dispatcher):
-        """Tell the system who the dispatcher is"""
-        self.dispatcher = dispatcher
-
-    def can_start_preparation(self, order_id, node):
-        """Check if we can start preparing items for an order at a specific location"""
-        if order_id not in self.order_states:
-            self.order_states[order_id] = {}
-
-        current_state = self.order_states[order_id].get(node, 'not_started')
-        return current_state == 'not_started'
-
-    def set_order_state(self, order_id, node, state):
-        """Update what stage an order is at for a specific location"""
-        if order_id not in self.order_states:
-            self.order_states[order_id] = {}
-        self.order_states[order_id][node] = state
-
-        SimLogger.log(f"Order state changed to '{state}' at node {node}",
-                      order_id=order_id, component_type="WarehouseSystem")
-
-    def get_order_state(self, order_id, node):
-        """Find out what stage an order is at for a specific location"""
-        return self.order_states.get(order_id, {}).get(node, 'not_started')
-
-    def cleanup_completed_order(self, order_id):
-        """Remove tracking info for orders that are finished"""
-        if order_id in self.order_states:
-            del self.order_states[order_id]
-
-# Create the main warehouse system that everyone will use
-warehouse_system = WarehouseSystem()
-
-# ===============================================================================
-# COORDINATE SYSTEM - Converts node numbers to screen positions
-# ===============================================================================
-
-def get_node_coordinates(node_number):
-    """
-    Convert a node number to x,y coordinates on screen.
-    Each aisle has 3 nodes: entry, middle (where ASRS is), and exit.
-    """
-    # Special locations
-    if node_number == DEPOT_NODE:
-        return (AnimationConfig.RIGHT_COLUMN_X - AnimationConfig.AISLE_WIDTH // 2, 30)
-    elif node_number == DROP_OFF_NODE:
-        return (AnimationConfig.LEFT_COLUMN_X + AnimationConfig.AISLE_WIDTH // 2, 30)
-    elif node_number == CHARGER_NODE:
-        return ((AnimationConfig.RIGHT_COLUMN_X - AnimationConfig.AISLE_WIDTH // 2 +
-                 AnimationConfig.LEFT_COLUMN_X + AnimationConfig.AISLE_WIDTH // 2) // 2, 30)
-    else:
-        # Calculate which aisle and position within that aisle
-        aisle_num = ((node_number - 1) // 3) + 1
-        position_in_aisle = (node_number - 1) % 3  # 0=entry, 1=middle, 2=exit
-
-        # Calculate aisle coordinates - U-shaped layout
-        if aisle_num <= NUM_AISLES // 2:  # Right column (aisles 1-10)
-            base_x = AnimationConfig.RIGHT_COLUMN_X
-            base_y = AnimationConfig.TOP_MARGIN + (aisle_num - 1) * AnimationConfig.AISLE_SPACING_Y
-        else:  # Left column (aisles 11-20)
-            base_x = AnimationConfig.LEFT_COLUMN_X
-            base_y = AnimationConfig.TOP_MARGIN + (NUM_AISLES - aisle_num) * AnimationConfig.AISLE_SPACING_Y
-
-        # Snake pattern for both columns
-        if aisle_num <= NUM_AISLES // 2:  # Right column: snake pattern
-            if aisle_num % 2 == 1:  # Odd aisles (1, 3, 5, 7, 9): LEFT TO RIGHT
-                if position_in_aisle == 0:  # Entry node (left side)
-                    return (base_x - AnimationConfig.AISLE_WIDTH // 2, base_y)
-                elif position_in_aisle == 1:  # Middle node (center - ASRS location)
-                    return (base_x, base_y)
-                else:  # Exit node (right side)
-                    return (base_x + AnimationConfig.AISLE_WIDTH // 2, base_y)
-            else:  # Even aisles (2, 4, 6, 8, 10): RIGHT TO LEFT
-                if position_in_aisle == 0:  # Entry node (right side)
-                    return (base_x + AnimationConfig.AISLE_WIDTH // 2, base_y)
-                elif position_in_aisle == 1:  # Middle node (center)
-                    return (base_x, base_y)
-                else:  # Exit node (left side)
-                    return (base_x - AnimationConfig.AISLE_WIDTH // 2, base_y)
-        else:  # Left column: snake pattern
-            if aisle_num % 2 == 1:  # Odd aisles (11, 13, 15, 17, 19): RIGHT TO LEFT
-                if position_in_aisle == 0:  # Entry node (right side)
-                    return (base_x + AnimationConfig.AISLE_WIDTH // 2, base_y)
-                elif position_in_aisle == 1:  # Middle node (center)
-                    return (base_x, base_y)
-                else:  # Exit node (left side)
-                    return (base_x - AnimationConfig.AISLE_WIDTH // 2, base_y)
-            else:  # Even aisles (12, 14, 16, 18, 20): LEFT TO RIGHT
-                if position_in_aisle == 0:  # Entry node (left side)
-                    return (base_x - AnimationConfig.AISLE_WIDTH // 2, base_y)
-                elif position_in_aisle == 1:  # Middle node (center)
-                    return (base_x, base_y)
-                else:  # Exit node (right side)
-                    return (base_x + AnimationConfig.AISLE_WIDTH // 2, base_y)
 
 def get_asrs_color(node_number):
     """Return color based on whether ASRS is working or not"""
@@ -303,7 +266,6 @@ def create_node_animation(node_number, node_type="normal"):
     """Create a visual dot and label for a location in the warehouse"""
     x, y = get_node_coordinates(node_number)
 
-    # Choose colors and sizes based on what type of location this is
     if node_type == "asrs":
         color = lambda t: get_asrs_color(node_number)
         radius = AnimationConfig.NODE_RADIUS
@@ -325,7 +287,6 @@ def create_node_animation(node_number, node_type="normal"):
         radius = AnimationConfig.NODE_RADIUS
         line_color = "darkblue"
 
-    # Create the circle
     sim.AnimateCircle(
         radius=radius,
         x=x, y=y,
@@ -334,21 +295,17 @@ def create_node_animation(node_number, node_type="normal"):
         linewidth=2
     )
 
-    # Create the number label
     text_color = "white" if node_type == "charger" else AnimationConfig.TEXT_COLOR
-    fontsize = 12
-
     sim.AnimateText(
         text=str(node_number if node_number != CHARGER_NODE else "62"),
         x=x, y=y,
-        fontsize=fontsize,
+        fontsize=12,
         textcolor=text_color,
         text_anchor="c"
     )
 
 def create_aisle_animation(aisle_num):
     """Create visual representation of one complete aisle with its 3 nodes"""
-    # Calculate where this aisle should be positioned
     if aisle_num <= NUM_AISLES // 2:
         x = AnimationConfig.RIGHT_COLUMN_X
         y = AnimationConfig.TOP_MARGIN + (aisle_num - 1) * AnimationConfig.AISLE_SPACING_Y
@@ -356,7 +313,6 @@ def create_aisle_animation(aisle_num):
         x = AnimationConfig.LEFT_COLUMN_X
         y = AnimationConfig.TOP_MARGIN + (NUM_AISLES - aisle_num) * AnimationConfig.AISLE_SPACING_Y
 
-    # Draw the aisle background rectangle
     sim.AnimateRectangle(
         spec=(x - AnimationConfig.AISLE_WIDTH // 2, y - AnimationConfig.AISLE_HEIGHT // 2,
               x + AnimationConfig.AISLE_WIDTH // 2, y + AnimationConfig.AISLE_HEIGHT // 2),
@@ -365,9 +321,8 @@ def create_aisle_animation(aisle_num):
         linewidth=2
     )
 
-    # Calculate node numbers for this aisle and create them
     entry_node = (aisle_num - 1) * 3 + 1
-    middle_node = (aisle_num - 1) * 3 + 2  # This is where the ASRS is
+    middle_node = (aisle_num - 1) * 3 + 2
     exit_node = (aisle_num - 1) * 3 + 3
 
     create_node_animation(entry_node, "asrs")
@@ -376,11 +331,9 @@ def create_aisle_animation(aisle_num):
 
 def setup_animation():
     """Create all the visual elements for the warehouse"""
-    # Create all aisles
     for aisle_num in range(1, NUM_AISLES + 1):
         create_aisle_animation(aisle_num)
 
-    # Create special locations
     create_node_animation(DEPOT_NODE, "depot")
     create_node_animation(DROP_OFF_NODE, "dropoff")
     create_node_animation(CHARGER_NODE, "charger")
@@ -389,11 +342,26 @@ def setup_animation():
 # PATH FINDING SYSTEM - Loads warehouse layout and finds shortest routes
 # ===============================================================================
 
+def distance_to_nearest_aisle_exit(agv):
+    """Return horizontal pixel distance from the AGV to the closest vertical corridor (aisle exit)."""
+    left_col_left = AnimationConfig.LEFT_COLUMN_X - AnimationConfig.AISLE_WIDTH // 2
+    left_col_right = AnimationConfig.LEFT_COLUMN_X + AnimationConfig.AISLE_WIDTH // 2
+    right_col_left = AnimationConfig.RIGHT_COLUMN_X - AnimationConfig.AISLE_WIDTH // 2
+    right_col_right = AnimationConfig.RIGHT_COLUMN_X + AnimationConfig.AISLE_WIDTH // 2
+
+    exits_x = (left_col_left, left_col_right, right_col_left, right_col_right)
+    return min(abs(agv.cur_x - ex) for ex in exits_x)
+
+def get_aisle_middle_node(node_number):
+    """Return the middle node of the aisle if node_number is an entry/exit node, else None."""
+    if not (1 <= node_number <= 60):
+        return None
+    aisle_num = ((node_number - 1) // 3) + 1
+    middle_node = (aisle_num - 1) * 3 + 2
+    return middle_node if node_number != middle_node else None
+
 def load_adjacency_matrix():
-    """
-    Load the map of how locations connect to each other.
-    This tells us which nodes are connected and how far apart they are.
-    """
+    """Load the map of how locations connect to each other."""
     try:
         adj_df = pd.read_csv(ADJACENCY_CSV, index_col=0)
         adjacency_dict = {}
@@ -419,34 +387,24 @@ def dijkstra_shortest_path(start, end, adjacency_dict):
     if start == end:
         return [start]
 
-    # Initialize distances to all nodes as infinite
     distances = {node: float('inf') for node in adjacency_dict.keys()}
     distances[start] = 0
     previous = {}
     unvisited = set(adjacency_dict.keys())
 
     while unvisited:
-        # Find unvisited node with smallest distance
         current = min(unvisited, key=lambda node: distances[node])
-
-        if distances[current] == float('inf'):
+        if distances[current] == float('inf') or current == end:
             break
-
-        if current == end:
-            break
-
         unvisited.remove(current)
 
-        # Check all neighbors of current node
         for neighbor, weight in adjacency_dict.get(current, {}).items():
             if neighbor in unvisited:
                 new_distance = distances[current] + weight
-
                 if new_distance < distances[neighbor]:
                     distances[neighbor] = new_distance
                     previous[neighbor] = current
 
-    # Build the path by working backwards
     if end not in previous and end != start:
         return []
 
@@ -463,42 +421,45 @@ def calculate_distance_between_nodes(from_node, to_node, adjacency_dict):
     """Calculate distance between two connected locations"""
     try:
         special_nodes = {DEPOT_NODE, DROP_OFF_NODE, CHARGER_NODE}
-
-        # Special locations are close to each other
         if from_node in special_nodes and to_node in special_nodes:
             return 0
 
-        # Charger is at same location as depot
         lookup_from = DEPOT_NODE if from_node == CHARGER_NODE else from_node
         lookup_to = DEPOT_NODE if to_node == CHARGER_NODE else to_node
 
         if lookup_from in adjacency_dict and lookup_to in adjacency_dict[lookup_from]:
             return adjacency_dict[lookup_from][lookup_to]
         else:
-            # Fallback distance calculation
             return abs(lookup_from - lookup_to) * 10
     except:
         return abs(from_node - to_node) * 10
 
-
-def get_node_congestion_penalty(node, target_node, requesting_agv):
-    """Penalize busy ASRS aisles and stuck AGVs, without scaring traffic off the vertical highway."""
+def get_node_congestion_penalty(node, target_node, requesting_agv, from_node=None):
+    """Penalize busy ASRS aisles, stuck AGVs, and opposite-direction aisle locks."""
     if node == target_node or node in (DEPOT_NODE, DROP_OFF_NODE, CHARGER_NODE):
         return 0.0
 
     penalty = 0.0
+
+    if node == 60 and target_node not in (60, DROP_OFF_NODE):
+        penalty += 500.0
+
     is_asrs_node = node in warehouse_system.asrs_dict
+
+    # Penalize entering an aisle locked in the opposite direction
+    if from_node is not None:
+        aisle_num, direction = get_aisle_and_direction(from_node, node)
+        if aisle_num is not None and not warehouse_system.can_enter_aisle(aisle_num, direction):
+            penalty += 300.0
 
     for other in warehouse_system.agv_list:
         if other is requesting_agv:
             continue
 
         if is_asrs_node:
-            # Heavily penalize entering an ASRS aisle if any AGV is there or heading there
             if other.current_node == node or other.next_node == node:
                 penalty += NODE_CONGESTION_PENALTY
         else:
-            # On highway/corridor nodes, only penalize if an AGV is actually stuck/queued
             if other.current_node == node and other.agv_status == "queued":
                 penalty += 25.0
 
@@ -510,8 +471,10 @@ def get_node_congestion_penalty(node, target_node, requesting_agv):
 
     return penalty
 
-def dijkstra_dynamic_shortest_path(start, end, adjacency_dict, requesting_agv, avoid_nodes=None):
-    """Find the lowest-cost path using live congestion penalties."""
+def dijkstra_dynamic_shortest_path(
+    start, end, adjacency_dict, requesting_agv, avoid_nodes=None, blocked_edge=None
+):
+    """Find the lowest-cost path using live congestion and direction-lock penalties."""
     if start == end:
         return [start]
 
@@ -529,10 +492,15 @@ def dijkstra_dynamic_shortest_path(start, end, adjacency_dict, requesting_agv, a
         unvisited.remove(current)
 
         for neighbor, weight in adjacency_dict.get(current, {}).items():
+            # Hard-skip the blocked edge (e.g., entering a busy side-bay from the front)
+            if blocked_edge and (current, neighbor) == blocked_edge:
+                continue
+
             if neighbor in unvisited:
-                # Discourage bouncing back to nodes already visited on this leg
                 loop_penalty = 500.0 if neighbor in avoid_nodes else 0.0
-                congestion_penalty = get_node_congestion_penalty(neighbor, end, requesting_agv)
+                congestion_penalty = get_node_congestion_penalty(
+                    neighbor, end, requesting_agv, from_node=current
+                )
                 new_distance = distances[current] + weight + congestion_penalty + loop_penalty
 
                 if new_distance < distances[neighbor]:
@@ -617,7 +585,6 @@ def generate_orders_ahead(seed, duration_seconds, items_pool):
 
     return order_defs
 
-
 class OrderFeeder(sim.Component):
     """Feeds precomputed orders into the simulation at scheduled times"""
     def setup(self, order_definitions):
@@ -639,27 +606,21 @@ class OrderFeeder(sim.Component):
             order.enter(order_queue)
             dispatcher.activate()
 
-
 # ===============================================================================
 # ORDER CLASS - Represents a customer order
 # ===============================================================================
 
 class Order(sim.Component):
-    """
-    Represents one customer order with multiple items.
-    Calculates the best path to collect all items.
-    """
     order_counter = 0
 
     def setup(self, items, timestamp):
         Order.order_counter += 1
         self.order_id = Order.order_counter
-        self.items = items  # List of items customer wants
-        self.timestamp = timestamp  # When order was created
+        self.items = items
+        self.timestamp = timestamp
         self.completion_time = None
         self.is_completed = False
 
-        # Group items by which aisle they're in
         self.items_by_node = {}
         nodes_to_visit = set()
 
@@ -670,33 +631,26 @@ class Order(sim.Component):
                 self.items_by_node[pickup_node] = []
             self.items_by_node[pickup_node].append(item)
 
-        # Calculate best path to visit all locations
         self.load_plan = self.calculate_complete_path_with_adjacency(list(nodes_to_visit))
         self.pickup_nodes = list(nodes_to_visit)
         self.num_items = len(items)
 
     def calculate_complete_path_with_adjacency(self, pickup_nodes):
-        """Calculate the best route to visit all pickup locations"""
         if not pickup_nodes:
             return [DEPOT_NODE, DROP_OFF_NODE]
 
-        # Visit nodes in order
         sorted_pickup_nodes = sorted(pickup_nodes)
         complete_path = [DEPOT_NODE]
         current_position = DEPOT_NODE
 
-        # Add path to each pickup location
         for pickup_node in sorted_pickup_nodes:
             path_to_pickup = dijkstra_shortest_path(current_position, pickup_node, adjacency_matrix)
-
             if len(path_to_pickup) > 1:
                 complete_path.extend(path_to_pickup[1:])
             elif len(complete_path) == 0:
                 complete_path.extend(path_to_pickup)
-
             current_position = pickup_node
 
-        # Add path to dropoff
         path_to_dropoff = dijkstra_shortest_path(current_position, DROP_OFF_NODE, adjacency_matrix)
         if len(path_to_dropoff) > 1:
             complete_path.extend(path_to_dropoff[1:])
@@ -704,10 +658,6 @@ class Order(sim.Component):
         return complete_path
 
     def trigger_container_preparation(self):
-        """
-        NEW METHOD ONLY: Tell ASRS machines to start preparing items immediately.
-        This happens before an AGV is even assigned.
-        """
         node_details = []
         for node in self.pickup_nodes:
             items_at_node = self.items_by_node[node]
@@ -717,7 +667,6 @@ class Order(sim.Component):
         SimLogger.log(f"Triggering item preparation for {len(self.pickup_nodes)} nodes: [{'], ['.join(node_details)}]",
                       order_id=self.order_id)
 
-        # Tell each ASRS to start preparing items
         for node in self.pickup_nodes:
             if not warehouse_system.can_start_preparation(self.order_id, node):
                 SimLogger.log(f"Preparation already in progress for node {node}, skipping",
@@ -726,7 +675,6 @@ class Order(sim.Component):
 
             warehouse_system.set_order_state(self.order_id, node, 'preparing')
 
-            # Find the ASRS at this location and give it work
             asrs = next((a for a in asrs_list if a.node_number == node), None)
             if asrs:
                 request_data = {
@@ -741,11 +689,9 @@ class Order(sim.Component):
                     asrs.prep_process.activate()
 
     def process(self):
-        """Orders don't do anything on their own - they wait to be processed"""
         self.passivate()
 
     def mark_completed(self):
-        """Mark this order as finished and update statistics"""
         if not self.is_completed:
             self.completion_time = env.now()
             self.is_completed = True
@@ -760,77 +706,50 @@ class Order(sim.Component):
 # ===============================================================================
 
 class Dispatcher(sim.Component):
-    """
-    The dispatcher is like a manager that assigns work to AGVs.
-    It looks at the queue of orders and the list of available AGVs,
-    and matches them up when possible.
-    """
     def setup(self):
-        self.order_queue = order_queue  # Orders waiting to be assigned
-        self.available_agvs = available_agvs  # AGVs ready for work
+        self.order_queue = order_queue
+        self.available_agvs = available_agvs
 
     def process(self):
-        """Main dispatching loop - matches orders with capable AGVs"""
         while True:
-            # Check if we have both orders and AGVs available
             if len(self.order_queue) > 0 and len(self.available_agvs) > 0:
-                order = self.order_queue.head()  # Peek at next order
-
-                # Find ANY available AGV (no battery check here)
-                suitable_agv = self.available_agvs[0]  # Just take the first available
-
-                # Assign order to AGV
+                suitable_agv = self.available_agvs[0]
                 order = self.order_queue.pop()
                 self.available_agvs.remove(suitable_agv)
                 SimLogger.log(f"Dispatching to AGV {suitable_agv.agv_id}",
                               order_id=order.order_id, component_type="Dispatcher")
                 suitable_agv.assign_order(order)
             else:
-                self.passivate()  # Wait for orders or AGVs
-
+                self.passivate()
 
 # ===============================================================================
 # ASRS CLASS - Automated Storage and Retrieval System
 # ===============================================================================
 
 class ASRS(sim.Component):
-    """
-    ASRS is the robot that picks items from shelves.
-    Each aisle has one ASRS in the middle.
-    The ASRS handles AGV requests and works with containers (in new method).
-    """
     def setup(self, node_number):
-        self.node_number = node_number  # Which aisle this ASRS is in
-        self.agv_queue = sim.Queue(f"ASRS_Node_{node_number}_Queue")  # AGVs waiting here
-        self.pick_time = sim.Normal(60, 45)  # How long to pick each item
-        self.is_active = False  # Whether currently working
-        self.current_picking_order = None  # Which order being picked
-        self.current_picking_items = 0  # How many items being picked
+        self.node_number = node_number
+        self.agv_queue = sim.Queue(f"ASRS_Node_{node_number}_Queue")
+        self.pick_time = sim.Normal(60, 45)
+        self.is_active = False
+        self.current_picking_order = None
+        self.current_picking_items = 0
 
-        # Create container and preparation process (for new method)
         self.container = Container(node_number=self.node_number, asrs=self)
         self.prep_process = ASRSContainerInterface(node_number=self.node_number, asrs=self)
         self.prep_process.activate()
 
-        # Setup visual display
         self.animation_manager = ASRSAnimationManager(self)
 
     def hand_items_to_container(self, order_id, items_list, prep_time=None):
-        """Give picked items to the container (new method only)"""
         self.container.receive_items_from_asrs(order_id, items_list, prep_time)
 
     def process(self):
-        """
-        Main ASRS process - handles AGVs that arrive for pickup.
-        Behavior depends on whether we're using old or new method.
-        """
         while True:
             if self.agv_queue.length() > 0:
                 agv = self.agv_queue.pop()
-
                 agv.agv_status = "picking_up"
 
-                # Move AGV to ASRS position for pickup
                 asrs_x, asrs_y = get_node_coordinates(self.node_number)
                 agv.cur_x, agv.cur_y = asrs_x, asrs_y
                 agv.animation_object.x = asrs_x
@@ -843,16 +762,13 @@ class ASRS(sim.Component):
 
                 if order and self.node_number in order.items_by_node:
                     if INNOVATION:
-                        # NEW METHOD: Use containers for batch transfer
                         current_state = warehouse_system.get_order_state(order.order_id, self.node_number)
 
                         if current_state == 'ready':
-                            # Container is ready, transfer immediately
                             self.container.request_transfer_to_agv(agv, order.order_id)
                             self.passivate()
                             env.stats.container_ready_transfers += 1
                         elif current_state == 'preparing':
-                            # Container being prepared, wait for it
                             SimLogger.log(f"AGV {agv.agv_id} waiting for ongoing preparation",
                                           order_id=order.order_id, component_type="ASRS Node",
                                           component_id=self.node_number)
@@ -862,7 +778,6 @@ class ASRS(sim.Component):
                             self.passivate()
                             env.stats.container_wait_transfers += 1
                         else:
-                            # No preparation started, do it now
                             if warehouse_system.can_start_preparation(order.order_id, self.node_number):
                                 self.is_active = True
                                 items_at_node = len(order.items_by_node[self.node_number])
@@ -875,31 +790,25 @@ class ASRS(sim.Component):
                                               order_id=order.order_id, component_type="ASRS Node",
                                               component_id=self.node_number)
 
-                                # Pick items one by one
                                 for i, item in enumerate(order.items_by_node[self.node_number]):
                                     item_prep_time = max(0, self.pick_time.sample())
-
                                     SimLogger.log(
                                         f"picking item {i + 1}/{items_at_node}: {item['ItemName']} (took {item_prep_time:.1f}s)",
                                         order_id=order.order_id, component_type="ASRS Node",
                                         component_id=self.node_number)
-
                                     self.hold(item_prep_time)
 
-                                # Give all items to container
                                 self.hand_items_to_container(order.order_id, order.items_by_node[self.node_number])
                                 warehouse_system.set_order_state(order.order_id, self.node_number, 'ready')
                                 self.container.request_transfer_to_agv(agv, order.order_id)
                                 self.passivate()
                                 env.stats.container_wait_transfers += 1
                             else:
-                                # Wait for ongoing preparation
                                 while warehouse_system.get_order_state(order.order_id, self.node_number) != 'ready':
                                     self.hold(1)
                                 self.container.request_transfer_to_agv(agv, order.order_id)
                                 self.passivate()
                     else:
-                        # OLD METHOD: Pick items and give directly to AGV
                         self.is_active = True
                         items_at_node = order.items_by_node[self.node_number]
                         self.current_picking_order = order.order_id
@@ -910,28 +819,24 @@ class ASRS(sim.Component):
                             order_id=order.order_id, component_type="ASRS Node", component_id=self.node_number)
 
                         total_prep_time = 0
-                        # Pick items one by one and give directly to AGV
                         for i, item in enumerate(items_at_node):
                             item_prep_time = max(0, self.pick_time.sample())
                             total_prep_time += item_prep_time
-
                             SimLogger.log(
                                 f"picking item {i + 1}/{len(items_at_node)}: {item['ItemName']})",
                                 order_id=order.order_id, component_type="ASRS Node", component_id=self.node_number)
-
                             self.hold(item_prep_time)
 
                         SimLogger.log(
                             f"completed sequential preparation of {len(items_at_node)} items (total picking took {total_prep_time:.1f}s)",
                             order_id=order.order_id, component_type="ASRS Node", component_id=self.node_number)
 
-                        # Clear status and give items directly to AGV
                         self.current_picking_order = None
                         self.current_picking_items = 0
                         self.is_active = False
 
                         env.stats.sequential_transfers += 1
-                        agv.loading_complete()  # Direct handoff to AGV
+                        agv.loading_complete()
 
                 SimLogger.log(f"AGV {agv.agv_id} moved back to travel position",
                               component_type="ASRS Node", component_id=self.node_number)
@@ -939,7 +844,6 @@ class ASRS(sim.Component):
                 self.passivate()
 
     def enqueue_agv(self, agv):
-        """Add an AGV to the queue waiting for service"""
         agv.enter(self.agv_queue)
         self.activate()
 
@@ -948,22 +852,15 @@ class ASRS(sim.Component):
 # ===============================================================================
 
 class Container(sim.Component):
-    """
-    Container sits next to each ASRS and holds items until AGV arrives.
-    This is only used in the new method (when INNOVATION = True).
-    Think of it as a temporary storage box.
-    """
     def setup(self, node_number, asrs):
-        self.node_number = node_number  # Which aisle this container is in
-        self.asrs = asrs  # The ASRS that fills this container
-        self.items_ready = {}  # Items ready for each order
-        self.transfer_queue = []  # AGVs waiting for items
+        self.node_number = node_number
+        self.asrs = asrs
+        self.items_ready = {}
+        self.transfer_queue = []
 
     def receive_items_from_asrs(self, order_id, items_list, prep_time=None):
-        """Receive items from ASRS and store them"""
         if order_id not in self.items_ready:
             self.items_ready[order_id] = []
-
         self.items_ready[order_id].extend(items_list)
 
         item_names = [item['ItemName'] for item in items_list]
@@ -978,12 +875,10 @@ class Container(sim.Component):
                           order_id=order_id, component_type="Container", component_id=self.node_number)
 
     def request_transfer_to_agv(self, agv, order_id):
-        """AGV requests items from container"""
         self.transfer_queue.append((agv, order_id))
         self.activate()
 
     def process(self):
-        """Handle transfers to AGVs"""
         while True:
             if self.transfer_queue:
                 agv, order_id = self.transfer_queue.pop(0)
@@ -993,33 +888,26 @@ class Container(sim.Component):
                     item_names = [item['ItemName'] for item in items_list]
                     items_detail = ', '.join(item_names)
 
-                    # Take time to transfer items
-                    transfer_time = 15
-                    self.hold(transfer_time)
+                    self.hold(15)
 
                     SimLogger.log(f"dropped items to AGV {agv.agv_id} - Items: [{items_detail}]",
                                   order_id=order_id, component_type="Container", component_id=self.node_number)
 
-                    # Remove items from container
                     del self.items_ready[order_id]
                     warehouse_system.set_order_state(order_id, self.node_number, 'transferred')
 
-                    # Tell AGV loading is complete
                     agv.loading_complete()
                     self.asrs.activate()
                 else:
-                    # No items ready, just complete loading
                     agv.loading_complete()
                     self.asrs.activate()
             else:
                 self.passivate()
 
     def has_items_for_order(self, order_id):
-        """Check if container has items ready for specific order"""
         return order_id in self.items_ready
 
     def has_items(self):
-        """Check if container has any items at all"""
         return len(self.items_ready) > 0
 
 # ===============================================================================
@@ -1027,54 +915,37 @@ class Container(sim.Component):
 # ===============================================================================
 
 class ASRSContainerInterface(sim.Component):
-    """
-    This is the part of the ASRS that prepares items in advance.
-    It works separately from the main ASRS process.
-    When orders come in, this starts picking items immediately
-    and puts them in containers, even before AGVs arrive.
-    This is only used in the new method.
-    """
     def setup(self, node_number, asrs):
-        self.node_number = node_number  # Which aisle this is for
-        self.asrs = asrs  # The ASRS machine this works with
-        self.preparation_queue = []  # List of preparation requests
+        self.node_number = node_number
+        self.asrs = asrs
+        self.preparation_queue = []
 
     def process(self):
-        """Main process that prepares items in advance"""
         while True:
-            # Wait for preparation requests
             while len(self.preparation_queue) == 0:
                 self.passivate()
 
             prep_request = self.preparation_queue.pop(0)
-
-            # Mark ASRS as busy
             self.asrs.is_active = True
-
-            # Set status for display
             self.asrs.current_picking_order = prep_request['order_id']
             self.asrs.current_picking_items = prep_request['num_items']
 
-            # Double-check we should still do this
             current_state = warehouse_system.get_order_state(prep_request['order_id'], self.node_number)
             if current_state != 'preparing':
                 SimLogger.log(f"Skipping preparation - state changed to {current_state}",
                               order_id=prep_request['order_id'], component_type="ASRS Node",
                               component_id=self.node_number)
-                # Clear status
                 self.asrs.current_picking_order = None
                 self.asrs.current_picking_items = 0
                 self.asrs.is_active = False
                 continue
 
-            # Create detailed item list for logging
             item_names = [item['ItemName'] for item in prep_request['items_list']]
             items_detail = ', '.join(item_names)
 
             SimLogger.log(f"starting item preparation - Items: [{items_detail}]",
                           order_id=prep_request['order_id'], component_type="ASRS Node", component_id=self.node_number)
 
-            # Pick items one by one and put in container
             items_list = prep_request['items_list']
             total_prep_time = 0
 
@@ -1086,15 +957,11 @@ class ASRSContainerInterface(sim.Component):
                               order_id=prep_request['order_id'], component_type="ASRS Node",
                               component_id=self.node_number)
 
-                self.hold(item_prep_time)  # Time to pick this item
-
-                # Put item in container immediately
+                self.hold(item_prep_time)
                 self.asrs.hand_items_to_container(prep_request['order_id'], [item], item_prep_time)
 
-            # Mark order as ready
             warehouse_system.set_order_state(prep_request['order_id'], self.node_number, 'ready')
 
-            # Clear status
             self.asrs.current_picking_order = None
             self.asrs.current_picking_items = 0
             self.asrs.is_active = False
@@ -1107,12 +974,6 @@ class ASRSContainerInterface(sim.Component):
 # ===============================================================================
 
 class AGV(sim.Component):
-    """
-    AGV is the robot vehicle that moves around the warehouse.
-    It picks up items from ASRS machines and delivers them to the drop-off point.
-    Each AGV has a battery that needs charging periodically.
-    """
-
     def setup(self, agv_id):
         self.agv_id = agv_id
         self.battery = MAX_CHARGE
@@ -1129,12 +990,10 @@ class AGV(sim.Component):
         self.items_picked_up = 0
         self.total_items_in_order = 0
 
-        # Track live screen coordinates for bounding-box collision checks
         depot_x, depot_y = get_node_coordinates(DEPOT_NODE)
         self.cur_x = depot_x
         self.cur_y = depot_y
 
-        # Setup animations using the manager
         self.animation_manager = AGVAnimationManager(self)
 
     def assign_order(self, order):
@@ -1148,14 +1007,13 @@ class AGV(sim.Component):
         self.activate()
 
     def is_path_blocked(self, next_x, next_y):
-        """Return True if moving to (next_x, next_y) overlaps another moving/traveling AGV ahead."""
+        """Return the blocking AGV ahead if (next_x, next_y) overlaps it, else None."""
         box_gap = AnimationConfig.AGV_SIZE + 4  # 15px AGV + 4px safety margin
         special_nodes = (DEPOT_NODE, DROP_OFF_NODE, CHARGER_NODE)
 
         for other in warehouse_system.agv_list:
             if other is self:
                 continue
-            # Ignore AGVs parked at special nodes OR pulled into an ASRS bay for loading
             if other.current_node in special_nodes or other.agv_status == "picking_up":
                 continue
 
@@ -1165,11 +1023,53 @@ class AGV(sim.Component):
                 curr_dist_sq = (self.cur_x - ox) ** 2 + (self.cur_y - oy) ** 2
                 next_dist_sq = (next_x - ox) ** 2 + (next_y - oy) ** 2
                 if next_dist_sq < curr_dist_sq:
-                    return True
-        return False
+                    return other
+        return None
+
+    def _count_waiting_at_depot(self):
+        """Count other AGVs currently idle/waiting for orders at the depot."""
+        return sum(
+            1
+            for other in warehouse_system.agv_list
+            if other is not self
+            and other.agv_status == "idle"
+            and other.current_node == DEPOT_NODE
+        )
+
+    def _opportunistic_charge_after_dropoff(self, opportunistic_threshold=3, min_waiting_to_keep_charging=2):
+        """Charge opportunistically after drop-off when >= threshold AGVs are already waiting at node 0."""
+        if self.battery >= MAX_CHARGE or self._count_waiting_at_depot() < opportunistic_threshold:
+            return False
+
+        SimLogger.log(
+            f"opportunistic charging at node {CHARGER_NODE} (battery={self.battery:.1f}%, waiting at depot={self._count_waiting_at_depot()})",
+            component_type="AGV",
+            component_id=self.agv_id,
+        )
+        self.agv_status = "charging"
+        self.current_node = CHARGER_NODE
+        cx, cy = get_node_coordinates(CHARGER_NODE)
+        self.cur_x, self.cur_y = cx, cy
+        self.animation_object.x = cx
+        self.animation_object.y = cy
+
+        self.recharge_count += 1
+        env.stats.total_recharges += 1
+
+        step_dt = 1.0
+        while self.battery < MAX_CHARGE and self._count_waiting_at_depot() > min_waiting_to_keep_charging:
+            self.hold(step_dt)
+            self.battery = min(MAX_CHARGE, self.battery + CHARGE_RATE * step_dt)
+
+        SimLogger.log(
+            f"finished opportunistic charging (battery={self.battery:.1f}%, waiting at depot={self._count_waiting_at_depot()})",
+            component_type="AGV",
+            component_id=self.agv_id,
+        )
+        return True
 
     def process(self):
-        """Main AGV operation loop with dynamic congestion-aware routing and decentralized charging"""
+        """Main AGV operation loop with dynamic congestion-aware routing, deadlock recovery, and side-bay queuing"""
         while True:
             if self.current_order is None:
                 if not self.is_available:
@@ -1194,6 +1094,8 @@ class AGV(sim.Component):
 
                 for target in targets:
                     visited_on_leg = {self.current_node}
+                    temp_avoid = set()
+                    prev_node = self.current_node
 
                     while self.current_node != target:
                         dynamic_path = dijkstra_dynamic_shortest_path(
@@ -1201,35 +1103,58 @@ class AGV(sim.Component):
                             target,
                             adjacency_matrix,
                             self,
-                            avoid_nodes=visited_on_leg,
+                            avoid_nodes=visited_on_leg | temp_avoid,
                         )
 
-                        if self.current_node in (0, 1, 6, 7):
-                            print(
-                                f"[t={env.now():.1f}] AGV {self.agv_id} at {self.current_node} "
-                                f"-> target {target} | path: {dynamic_path[:4]} "
-                                f"| neighbors: {list(adjacency_matrix.get(self.current_node, {}).keys())}"
-                            )
-
                         if len(dynamic_path) < 2:
-                            break  # Safety fallback if no path exists
+                            if temp_avoid:
+                                temp_avoid.clear()
+                                self.hold(1.0)
+                                continue
+                            break
 
                         next_node = dynamic_path[1]
                         self.agv_status = "moving"
-                        self.travel_to_node_with_animation(next_node)
-                        visited_on_leg.add(next_node)
+                        origin = self.current_node
+                        reached = self.travel_to_node_with_animation(next_node)
+
+                        if reached:
+                            prev_node = origin
+                            visited_on_leg.add(next_node)
+                            temp_avoid.discard(next_node)
+                        else:
+                            stepped = self.step_aside_from_aisle(next_node)
+                            if stepped:
+                                visited_on_leg = {self.current_node}
+                                temp_avoid.add(next_node)
+                            else:
+                                temp_avoid.add(next_node)
 
                     if target in pickup_nodes:
                         self.agv_status = "queued"
-                        SimLogger.log(
-                            f"queued at node {target}",
-                            order_id=self.current_order.order_id,
-                            component_type="AGV",
-                            component_id=self.agv_id,
-                        )
                         asrs = next((a for a in asrs_list if a.node_number == target), None)
                         if asrs:
                             wait_start = env.now()
+                            middle_node = get_aisle_middle_node(target)
+
+                            # Check if another AGV is already picking up or queued at this node
+                            asrs_busy = (
+                                asrs.agv_queue.length() > 0
+                                or any(
+                                    other is not self
+                                    and other.current_node == target
+                                    and other.agv_status == "picking_up"
+                                    for other in warehouse_system.agv_list
+                                )
+                            )
+
+                            if asrs_busy:
+                                if middle_node is not None and asrs.agv_queue.length() > 0 and prev_node != middle_node:
+                                    self.reroute_behind_queue(target, middle_node, asrs)
+                                else:
+                                    wait_x, wait_y = get_asrs_queue_position(target, queue_index=asrs.agv_queue.length())
+                                    self.move_smoothly_to(wait_x, wait_y)
+
                             asrs.enqueue_agv(self)
                             self.passivate()
                             wait_time = env.now() - wait_start
@@ -1256,13 +1181,23 @@ class AGV(sim.Component):
                         component_id=self.agv_id,
                     )
                     self.go_to_charger()
+                elif self.current_node == DROP_OFF_NODE and self._opportunistic_charge_after_dropoff():
+                    self.current_node = DEPOT_NODE
+                    depot_x, depot_y = get_node_coordinates(DEPOT_NODE)
+                    self.cur_x, self.cur_y = depot_x, depot_y
+                    self.animation_object.x = depot_x
+                    self.animation_object.y = depot_y
+                    SimLogger.log(
+                        "arrived at depot",
+                        component_type="AGV",
+                        component_id=self.agv_id,
+                    )
                 else:
                     self.return_to_depot()
 
                 self.agv_status = "idle"
 
     def return_to_depot(self):
-        """Return AGV to depot from current position"""
         if self.current_node == DEPOT_NODE:
             return
 
@@ -1282,7 +1217,6 @@ class AGV(sim.Component):
             return
 
         path_to_depot = dijkstra_shortest_path(self.current_node, DEPOT_NODE, adjacency_matrix)
-
         for i, node in enumerate(path_to_depot):
             if i == 0:
                 continue
@@ -1302,7 +1236,6 @@ class AGV(sim.Component):
 
         if 1 <= self.current_node <= 60:
             asrs_x, asrs_y = get_node_coordinates(self.current_node)
-            self.cur_x = asrs_x
             self.cur_x, self.cur_y = asrs_x, asrs_y - AnimationConfig.AGV_TRAVEL_OFFSET
             self.animation_object.x = self.cur_x
             self.animation_object.y = self.cur_y
@@ -1351,104 +1284,293 @@ class AGV(sim.Component):
         self.animation_object.x = depot_x
         self.animation_object.y = depot_y
 
-    def is_path_blocked(self, next_x, next_y):
-        """Return True if moving to (next_x, next_y) overlaps another AGV ahead."""
-        box_gap = AnimationConfig.AGV_SIZE + 4  # 15px AGV + 4px safety margin
-        special_nodes = (DEPOT_NODE, DROP_OFF_NODE, CHARGER_NODE)
+    def step_aside_from_aisle(self, blocked_node):
+        """Move to a free corridor neighbor to physically vacate the node for an incoming AGV."""
+        neighbors = list(adjacency_matrix.get(self.current_node, {}).keys())
+        blocked_aisle = ((blocked_node - 1) // 3) + 1 if 1 <= blocked_node <= 60 else None
 
+        # Prefer neighbors outside the blocked aisle (vertical corridor or cross-link)
+        candidates = [
+            n for n in neighbors
+            if n != blocked_node
+            and n not in (DEPOT_NODE, DROP_OFF_NODE, CHARGER_NODE)
+            and (((n - 1) // 3) + 1 if 1 <= n <= 60 else None) != blocked_aisle
+        ]
+
+        # Sort so unoccupied neighbors are tried first
+        def is_occupied(node):
+            return any(
+                other is not self and (other.current_node == node or other.next_node == node)
+                for other in warehouse_system.agv_list
+            )
+
+        candidates.sort(key=is_occupied)
+
+        for escape_node in candidates:
+            start_node = self.current_node
+            SimLogger.log(
+                f"stepping aside {start_node} -> {escape_node} to clear blocked node {blocked_node}",
+                component_type="AGV",
+                component_id=self.agv_id,
+            )
+            if self.travel_to_node_with_animation(escape_node):
+                env.stats.deadlocks_cleared += 1
+                SimLogger.log(
+                    f"DEADLOCK AVOIDED: vacated node {start_node} -> now at {escape_node}",
+                    component_type="AGV",
+                    component_id=self.agv_id,
+                )
+                return True
+
+        # Fallback for node 60 bottleneck: duck into Drop-Off bay (61) so queued traffic can drain
+        if self.current_node == 60:
+            env.stats.deadlocks_cleared += 1
+            SimLogger.log(
+                "node 60 gridlocked -> ducking into Drop-Off bay (61) to let traffic clear",
+                component_type="AGV",
+                component_id=self.agv_id,
+            )
+            drop_x, drop_y = get_node_coordinates(DROP_OFF_NODE)
+            self.move_smoothly_to(drop_x, drop_y)
+            self.current_node = DROP_OFF_NODE
+            self.agv_status = "queued"
+
+            # Wait briefly for jammed AGVs to clear node 60
+            self.hold(10.0)
+            while any(
+                other is not self and other.current_node == 60
+                for other in warehouse_system.agv_list
+            ):
+                self.hold(1.0)
+
+            # Pull back up to node 60 travel lane and resume
+            self.current_node = 60
+            x60, y60 = get_node_coordinates(60)
+            self.move_smoothly_to(x60, y60 - AnimationConfig.AGV_TRAVEL_OFFSET)
+            SimLogger.log(
+                "DEADLOCK AVOIDED: returned to node 60 after traffic cleared",
+                component_type="AGV",
+                component_id=self.agv_id,
+            )
+            return True
+
+        return False
+
+    def reroute_behind_queue(self, target_node, middle_node, asrs):
+        """Loop around to middle_node so this AGV approaches the side-bay from behind the queue."""
+        env.stats.reroute_count += 1
+        env.stats.fifo_reroute_count += 1
+        SimLogger.log(
+            f"side-bay at node {target_node} occupied -> rerouting via middle node {middle_node} for FIFO queuing",
+            order_id=self.current_order.order_id,
+            component_type="AGV",
+            component_id=self.agv_id,
+        )
+
+        # 1. Travel to middle_node without crossing the occupied side-bay edge (target_node -> middle_node)
+        visited = {self.current_node}
+        while self.current_node != middle_node:
+            detour_path = dijkstra_dynamic_shortest_path(
+                self.current_node,
+                middle_node,
+                adjacency_matrix,
+                self,
+                avoid_nodes=visited,
+                blocked_edge=(target_node, middle_node),
+            )
+            if len(detour_path) < 2:
+                break
+            next_hop = detour_path[1]
+            if self.travel_to_node_with_animation(next_hop):
+                visited.add(next_hop)
+            else:
+                self.step_aside_from_aisle(next_hop)
+
+        # 2. Approach target_node from middle_node and stop at the back of the FIFO queue
+        slot_index = asrs.agv_queue.length()
+        wait_x, wait_y = get_asrs_queue_position(target_node, queue_index=slot_index)
+        self.move_smoothly_to(wait_x, wait_y)
+        self.current_node = target_node
+
+    def move_smoothly_to(self, target_x, target_y, step_dt=0.25):
+        """Smoothly animate a short local move (e.g., pulling into a side-bay) without teleporting."""
+        start_x, start_y = self.cur_x, self.cur_y
+        pixel_dist = ((target_x - start_x) ** 2 + (target_y - start_y) ** 2) ** 0.5
+        if pixel_dist < 1.0:
+            self.cur_x, self.cur_y = target_x, target_y
+            self.animation_object.x = target_x
+            self.animation_object.y = target_y
+            return
+
+        # Convert pixels to approximate meters (400px aisle = 50m -> 8px per meter)
+        meters = pixel_dist / 8.0
+        total_time = max(step_dt, meters / AGV_SPEED)
+        steps = max(1, int(round(total_time / step_dt)))
+
+        for i in range(1, steps + 1):
+            progress = i / steps
+            self.cur_x = start_x + (target_x - start_x) * progress
+            self.cur_y = start_y + (target_y - start_y) * progress
+            self.animation_object.x = self.cur_x
+            self.animation_object.y = self.cur_y
+            self.hold(total_time / steps)
+
+    def is_blocking_another_agv(self):
+        """Return True if another AGV is trying to enter this node or is queued right next to us."""
         for other in warehouse_system.agv_list:
-            if other is self:
+            if other is self or other.agv_status in ("idle", "charging", "picking_up"):
                 continue
-            # Ignore AGVs parked at depot, drop-off, or charger
-            if other.current_node in special_nodes:
-                continue
-
-            ox, oy = other.cur_x, other.cur_y
-
-            # Check if bounding boxes overlap at the candidate position
-            if abs(next_x - ox) < box_gap and abs(next_y - oy) < box_gap:
-                # Only block if this step moves us closer to the other AGV
-                curr_dist_sq = (self.cur_x - ox) ** 2 + (self.cur_y - oy) ** 2
-                next_dist_sq = (next_x - ox) ** 2 + (next_y - oy) ** 2
-                if next_dist_sq < curr_dist_sq:
-                    return True
+            # Another AGV is heading directly to our current node (e.g., exiting the locked aisle)
+            if other.next_node == self.current_node:
+                return True
+            # Another AGV is queued right next to our bounding box
+            if (
+                other.agv_status == "queued"
+                and abs(self.cur_x - other.cur_x) < AnimationConfig.AGV_SIZE + 15
+                and abs(self.cur_y - other.cur_y) < AnimationConfig.AGV_SIZE + 15
+            ):
+                return True
         return False
 
     def travel_to_node_with_animation(self, destination_node):
-        """Travel step-by-step with bounding-box collision avoidance."""
+        """Travel step-by-step with aisle locks, collision avoidance, and deadlock recovery.
+        Returns True if destination_node was reached, False if aborted to resolve a deadlock.
+        """
         if self.current_node == destination_node:
-            return
+            return True
 
         self.next_node = destination_node
 
-        dest_x, dest_y = get_node_coordinates(destination_node)
-        if 1 <= destination_node <= 60:
-            dest_y -= AnimationConfig.AGV_TRAVEL_OFFSET
-
-        start_x, start_y = self.cur_x, self.cur_y
-        distance = calculate_distance_between_nodes(
-            self.current_node, destination_node, adjacency_matrix
-        )
-
-        if distance <= 0:
-            self.cur_x, self.cur_y = dest_x, dest_y
-            self.animation_object.x = dest_x
-            self.animation_object.y = dest_y
-            self.current_node = destination_node
-            self.next_node = None
-            self.hold(0.1)
-            return
-
-        step_dt = 0.5  # seconds per micro-step (use 1.0 for faster 24h headless runs)
-        traveled = 0.0
-
-        while traveled < distance:
-            step_dist = min(AGV_SPEED * step_dt, distance - traveled)
-            step_time = step_dist / AGV_SPEED
-            progress = (traveled + step_dist) / distance
-
-            next_x = start_x + (dest_x - start_x) * progress
-            next_y = start_y + (dest_y - start_y) * progress
-
-            # Wait in place if another AGV's bounding box blocks the next step
-            if self.is_path_blocked(next_x, next_y):
+        # Acquire aisle direction lock if traveling horizontally inside an aisle
+        aisle_num, direction = get_aisle_and_direction(self.current_node, destination_node)
+        lock_acquired = False
+        if aisle_num is not None:
+            wait_for_lock = 0.0
+            waited_on_aisle = False
+            while not warehouse_system.can_enter_aisle(aisle_num, direction):
+                if not waited_on_aisle:
+                    env.stats.aisle_lock_waits += 1
+                    waited_on_aisle = True
                 self.agv_status = "queued"
-                self.total_waiting_time += step_dt
-                self.hold(step_dt)
-                continue
+                self.total_waiting_time += 0.5
+                env.stats.aisle_lock_wait_time += 0.5
+                wait_for_lock += 0.5
+                self.hold(0.5)
+                if wait_for_lock >= 2.0 and self.is_blocking_another_agv():
+                    env.stats.reroute_count += 1
+                    self.next_node = None
+                    return False
+            warehouse_system.enter_aisle(aisle_num, direction)
+            lock_acquired = True
+            if waited_on_aisle:
+                env.stats.aisle_lock_entered_after_wait += 1
 
-            # Advance one step
-            self.agv_status = "moving"
-            self.cur_x, self.cur_y = next_x, next_y
-            self.animation_object.x = next_x
-            self.animation_object.y = next_y
+        try:
+            dest_x, dest_y = get_node_coordinates(destination_node)
+            if 1 <= destination_node <= 60:
+                dest_y -= AnimationConfig.AGV_TRAVEL_OFFSET
 
-            energy_consumed = step_dist * ENERGY_PER_METER
-            self.battery = max(0, self.battery - energy_consumed)
-            self.total_distance += step_dist
-            traveled += step_dist
+            start_x, start_y = self.cur_x, self.cur_y
+            distance = calculate_distance_between_nodes(
+                self.current_node, destination_node, adjacency_matrix
+            )
 
-            self.hold(step_time)
+            if distance <= 0:
+                self.cur_x, self.cur_y = dest_x, dest_y
+                self.animation_object.x = dest_x
+                self.animation_object.y = dest_y
+                self.current_node = destination_node
+                self.hold(0.1)
+                return True
 
-        self.current_node = destination_node
-        self.next_node = None
+            step_dt = 0.5
+            traveled = 0.0
+            blocked_time = 0.0
+            deadlock_timeout = 2.0
 
+            while traveled < distance:
+                step_dist = min(AGV_SPEED * step_dt, distance - traveled)
+                step_time = step_dist / AGV_SPEED
+                progress = (traveled + step_dist) / distance
+
+                next_x = start_x + (dest_x - start_x) * progress
+                next_y = start_y + (dest_y - start_y) * progress
+
+                blocker = self.is_path_blocked(next_x, next_y)
+                if blocker is not None:
+                    self.agv_status = "queued"
+                    self.total_waiting_time += step_dt
+                    blocked_time += step_dt
+                    self.hold(step_dt)
+
+                    # Deadlock check: stuck for >= deadlock_timeout behind a queued AGV
+                    if blocked_time >= deadlock_timeout and blocker.agv_status == "queued":
+                        my_exit_dist = distance_to_nearest_aisle_exit(self)
+                        other_exit_dist = distance_to_nearest_aisle_exit(blocker)
+
+                        # Yield if closer to the aisle exit; break chain tie after 2x timeout
+                        should_yield = (
+                            (my_exit_dist < other_exit_dist)
+                            or (my_exit_dist == other_exit_dist and self.agv_id > blocker.agv_id)
+                            or (blocked_time >= deadlock_timeout * 2.0 and self.agv_id > blocker.agv_id)
+                        )
+
+                        if should_yield:
+                            env.stats.reroute_count += 1
+                            SimLogger.log(
+                                f"deadlock with AGV {blocker.agv_id} near node {self.current_node} -> yielding and rerouting",
+                                component_type="AGV",
+                                component_id=self.agv_id,
+                            )
+                            # Reverse smoothly back to start_x, start_y (same direction as blocker)
+                            while traveled > 0:
+                                back_dist = min(AGV_SPEED * step_dt, traveled)
+                                traveled -= back_dist
+                                back_progress = traveled / distance
+                                self.cur_x = start_x + (dest_x - start_x) * back_progress
+                                self.cur_y = start_y + (dest_y - start_y) * back_progress
+                                self.animation_object.x = self.cur_x
+                                self.animation_object.y = self.cur_y
+                                self.agv_status = "moving"
+                                self.total_distance += back_dist
+                                self.battery = max(0, self.battery - back_dist * ENERGY_PER_METER)
+                                self.hold(back_dist / AGV_SPEED)
+
+                            return False
+                    continue
+
+                blocked_time = 0.0
+                self.agv_status = "moving"
+                self.cur_x, self.cur_y = next_x, next_y
+                self.animation_object.x = next_x
+                self.animation_object.y = next_y
+
+                energy_consumed = step_dist * ENERGY_PER_METER
+                self.battery = max(0, self.battery - energy_consumed)
+                self.total_distance += step_dist
+                traveled += step_dist
+
+                self.hold(step_time)
+
+            self.current_node = destination_node
+            return True
+        finally:
+            self.next_node = None
+            if lock_acquired:
+                warehouse_system.leave_aisle(aisle_num)
 
 # ===============================================================================
 # AGV ANIMATION MANAGER - Controls how AGVs look and move on screen
 # ===============================================================================
 
 class AGVAnimationManager:
-    """Handles all the visual aspects of an AGV - colors, position, battery display, etc."""
     def __init__(self, agv):
         self.agv = agv
         self.setup_animations()
 
     def setup_animations(self):
-        """Create all visual elements for this AGV"""
         depot_x, depot_y = get_node_coordinates(DEPOT_NODE)
 
-        # Main AGV rectangle
         self.agv.animation_object = sim.AnimateRectangle(
             spec=(-AnimationConfig.AGV_SIZE // 2, -AnimationConfig.AGV_SIZE // 2,
                   AnimationConfig.AGV_SIZE // 2, AnimationConfig.AGV_SIZE // 2),
@@ -1458,7 +1580,6 @@ class AGVAnimationManager:
             x=depot_x, y=depot_y
         )
 
-        # AGV ID number
         self.agv.animation_text = sim.AnimateText(
             text=lambda t: f"{self.agv.agv_id}",
             x=lambda t: self.agv.animation_object.x(t) if callable(
@@ -1470,7 +1591,6 @@ class AGVAnimationManager:
             text_anchor="c"
         )
 
-        # Item counter (placed below the battery bar so it doesn't overlap neighboring AGVs)
         self.agv.item_counter_text = sim.AnimateText(
             text=lambda t: self.get_item_counter_text(),
             x=lambda t: self.agv.animation_object.x(t) if callable(
@@ -1482,14 +1602,11 @@ class AGVAnimationManager:
             text_anchor="c"
         )
 
-        # Battery level display
         self.setup_battery_animation()
 
     def setup_battery_animation(self):
-        """Create the battery level bar under the AGV"""
         battery_width, battery_height = AnimationConfig.AGV_SIZE, 5
 
-        # Red background (empty battery)
         self.agv.battery_bg = sim.AnimateRectangle(
             spec=(-battery_width // 2, -AnimationConfig.AGV_SIZE // 2 - battery_height - 2,
                   battery_width // 2, -AnimationConfig.AGV_SIZE // 2 - 2),
@@ -1501,7 +1618,6 @@ class AGVAnimationManager:
                 self.agv.animation_object.y) else self.agv.animation_object.y
         )
 
-        # Green foreground (shows actual battery level)
         self.agv.battery_fg = sim.AnimateRectangle(
             spec=lambda t: self.get_battery_spec(battery_width, battery_height),
             fillcolor="green",
@@ -1513,7 +1629,6 @@ class AGVAnimationManager:
         )
 
     def get_agv_color(self):
-        """Return the right color based on what the AGV is doing"""
         status_colors = {
             "idle": AnimationConfig.AGV_IDLE,
             "moving": AnimationConfig.AGV_MOVING,
@@ -1524,19 +1639,15 @@ class AGVAnimationManager:
         return status_colors.get(self.agv.agv_status, "gray")
 
     def get_item_counter_text(self):
-        """Return the item counter text for display"""
-        # Only show counter when AGV has an active order AND is not idle/charging
         if (self.agv.current_order is not None and
                 self.agv.agv_status not in ["idle", "charging"]):
             return f"{self.agv.items_picked_up}/{self.agv.total_items_in_order}"
         else:
-            return ""  # Empty string when idle, charging, or no order
+            return ""
 
     def get_battery_spec(self, battery_width, battery_height):
-        """Calculate how much of the battery bar should be green"""
         battery_percentage = max(0, min(100, self.agv.battery)) / 100.0
         green_width = battery_width * battery_percentage
-
         return (-battery_width // 2, -AnimationConfig.AGV_SIZE // 2 - battery_height - 2,
                 -battery_width // 2 + green_width, -AnimationConfig.AGV_SIZE // 2 - 2)
 
@@ -1545,16 +1656,13 @@ class AGVAnimationManager:
 # ===============================================================================
 
 class ASRSAnimationManager:
-    """Handles visual display for ASRS machines - shows when they're working and container status"""
     def __init__(self, asrs):
         self.asrs = asrs
         self.setup_animations()
 
     def setup_animations(self):
-        """Create visual elements for this ASRS machine"""
         asrs_x, asrs_y = get_node_coordinates(self.asrs.node_number)
 
-        # Status text showing what the ASRS is doing
         self.asrs.status_text = sim.AnimateText(
             text=lambda t: self.get_picking_status_text(),
             x=asrs_x - 50,
@@ -1564,7 +1672,6 @@ class ASRSAnimationManager:
             text_anchor="e"
         )
 
-        # Container indicator (only if using new innovation method)
         if INNOVATION:
             container_width, container_height = AnimationConfig.NODE_RADIUS * 2, 4
             self.asrs.container_indicator = sim.AnimateRectangle(
@@ -1575,18 +1682,15 @@ class ASRSAnimationManager:
                 x=asrs_x, y=asrs_y
             )
         else:
-            # No container indicator for old method
             self.asrs.container_indicator = None
 
     def get_picking_status_text(self):
-        """Return text showing what the ASRS is currently picking"""
         if self.asrs.current_picking_order and self.asrs.current_picking_items > 0:
             return f"ASRS picking {self.asrs.current_picking_items} for O-{self.asrs.current_picking_order}"
         else:
             return ""
 
     def get_container_color(self):
-        """Return color showing if container has items ready"""
         if INNOVATION and hasattr(self.asrs, 'container') and self.asrs.container.has_items():
             return AnimationConfig.CONTAINER_READY
         else:
@@ -1597,22 +1701,11 @@ class ASRSAnimationManager:
 # ===============================================================================
 
 class SimLogger:
-    """Simple system to print organized messages about what's happening in the simulation"""
     @staticmethod
     def log(message, order_id=None, component_type=None, component_id=None):
-        """Print a message with time stamp and component info"""
         time_str = f"[{env.now():.1f}T]"
-
-        if order_id:
-            order_str = f"O{order_id} - "
-        else:
-            order_str = ""
-
-        if component_type and component_id:
-            comp_str = f"{component_type} {component_id}: "
-        else:
-            comp_str = ""
-
+        order_str = f"O{order_id} - " if order_id else ""
+        comp_str = f"{component_type} {component_id}: " if (component_type and component_id) else ""
         print(f"{time_str}: {order_str}{comp_str}{message}")
 
 # ===============================================================================
@@ -1629,6 +1722,14 @@ class WarehouseStats:
         self.container_ready_transfers = 0
         self.container_wait_transfers = 0
         self.sequential_transfers = 0
+
+        # Traffic, aisle-lock, rerouting, and deadlock metrics
+        self.aisle_lock_waits = 0            # Times an AGV had to wait for an aisle direction lock
+        self.aisle_lock_wait_time = 0.0      # Total seconds spent waiting for aisle direction locks
+        self.aisle_lock_entered_after_wait = 0  # Times an AGV waited on the aisle side and then entered
+        self.reroute_count = 0               # Total reroutes triggered (deadlock yield, lock abort, FIFO)
+        self.fifo_reroute_count = 0          # Reroutes specifically via middle node for FIFO queuing
+        self.deadlocks_cleared = 0           # Deadlocks successfully cleared by yielding/stepping aside
 
     def update_agv_stats(self, agvs):
         self.total_agv_distance = sum(agv.total_distance for agv in agvs)
@@ -1684,35 +1785,110 @@ class WarehouseStats:
             print(f"  - Current status: {agv.agv_status}")
             print(f"  - Current node: {agv.current_node}")
 
+        print(f"\n===== Traffic, Aisle-Lock & Deadlock Summary =====")
+        print(f"Aisle direction lock wait events: {self.aisle_lock_waits}")
+        print(f"Total time waiting on aisle direction locks: {self.aisle_lock_wait_time / 60:.2f} minutes")
+        print(f"Waited on aisle side & then entered once free: {self.aisle_lock_entered_after_wait}")
+        print(f"Total reroutings: {self.reroute_count} (FIFO middle-node detours: {self.fifo_reroute_count})")
+        print(f"Deadlocks successfully cleared: {self.deadlocks_cleared}")
 
 
-# Initialize simulation
+class DeadlockMonitor(sim.Component):
+    """Logs a snapshot if an AGV freezes >= 10s, and confirms when it recovers."""
+    def setup(self, check_interval=5.0, stuck_threshold=10.0):
+        self.check_interval = check_interval
+        self.stuck_threshold = stuck_threshold
+        self.last_pos = {}
+        self.stuck_time = {}
+        self.reported_stuck = set()  # Track AGVs that were flagged
+
+    def process(self):
+        while True:
+            self.hold(self.check_interval)
+            stuck_agvs = []
+
+            for agv in warehouse_system.agv_list:
+                pos = (round(agv.cur_x, 1), round(agv.cur_y, 1))
+
+                if agv.agv_status in ("idle", "charging", "picking_up"):
+                    if agv.agv_id in self.reported_stuck:
+                        print(f"[t={env.now():.1f}s] [STUCK RESOLVED] AGV {agv.agv_id} is now {agv.agv_status} at node {agv.current_node}")
+                        self.reported_stuck.remove(agv.agv_id)
+                    self.stuck_time[agv.agv_id] = 0.0
+                    self.last_pos[agv.agv_id] = pos
+                    continue
+
+                if self.last_pos.get(agv.agv_id) == pos:
+                    self.stuck_time[agv.agv_id] = self.stuck_time.get(agv.agv_id, 0.0) + self.check_interval
+                else:
+                    if agv.agv_id in self.reported_stuck:
+                        print(f"[t={env.now():.1f}s] [STUCK RESOLVED] AGV {agv.agv_id} resumed moving (now at {pos}, edge={agv.current_node}->{agv.next_node})")
+                        self.reported_stuck.remove(agv.agv_id)
+                    self.stuck_time[agv.agv_id] = 0.0
+                    self.last_pos[agv.agv_id] = pos
+
+                if self.stuck_time[agv.agv_id] >= self.stuck_threshold:
+                    stuck_agvs.append(agv)
+                    self.reported_stuck.add(agv.agv_id)
+
+            if stuck_agvs:
+                print(f"\n========== [STUCK MONITOR t={env.now():.1f}s] ==========")
+                for agv in stuck_agvs:
+                    order_id = agv.current_order.order_id if agv.current_order else None
+                    in_asrs_q = [
+                        n for n, asrs in warehouse_system.asrs_dict.items()
+                        if agv in asrs.agv_queue
+                    ]
+                    aisle_num, direction = (
+                        get_aisle_and_direction(agv.current_node, agv.next_node)
+                        if agv.next_node is not None else (None, None)
+                    )
+                    lock_info = warehouse_system.aisle_locks.get(aisle_num) if aisle_num else None
+
+                    nearby = []
+                    for other in warehouse_system.agv_list:
+                        if other is agv:
+                            continue
+                        if abs(agv.cur_x - other.cur_x) < 30 and abs(agv.cur_y - other.cur_y) < 30:
+                            nearby.append(f"AGV {other.agv_id}({other.agv_status}@{other.cur_x:.0f},{other.cur_y:.0f})")
+
+                    print(
+                        f"  AGV {agv.agv_id:2d} | stuck={self.stuck_time[agv.agv_id]:.0f}s | status={agv.agv_status:8s} "
+                        f"| edge={agv.current_node}->{agv.next_node} | pos=({agv.cur_x:.0f},{agv.cur_y:.0f}) "
+                        f"| O{order_id} | in_asrs_q={in_asrs_q} | aisle_lock={aisle_num}:{lock_info} "
+                        f"| nearby={nearby}"
+                    )
+                print("=================================================\n")
+
+
+
+# ===============================================================================
+# INITIALIZATION & EXECUTION
+# ===============================================================================
+
 env = sim.Environment(trace=False)
 env.animation_parameters(
     animate=True,
-    width=AnimationConfig.WINDOW_WIDTH*0.8,
-    height=AnimationConfig.WINDOW_HEIGHT*0.8,
-    speed=30,  # 30x simulation speed (adjust as needed)
+    width=1200,
+    height=750,
+    x0=10,
+    y0=0,
+    x1=1040,
+    speed=30,
 )
 env.stats = WarehouseStats()
 
-# Load adjacency matrix and warehouse data
 warehouse_items = load_warehouse_data()
 adjacency_matrix = load_adjacency_matrix()
-for test_node in [0, 1, 2, 3, 6, 7]:
-    print(f"DEBUG Neighbors of {test_node}: {adjacency_matrix.get(test_node)}")
 
-# Initialize component lists and queues
 asrs_list = []
 agv_list = []
 all_orders = []
 available_agvs = []
 order_queue = sim.Queue("Order_Queue")
 
-# Setup animation
 setup_animation()
 
-# Create ASRS systems for each unique node that has items
 unique_nodes = set(item['AisleLocation'] for item in warehouse_items)
 for node in sorted(unique_nodes):
     asrs = ASRS(name=f"ASRS_Node_{node}", node_number=node)
@@ -1721,7 +1897,6 @@ for node in sorted(unique_nodes):
 
 SimLogger.log(f"Created {len(asrs_list)} ASRS systems for nodes: {sorted(unique_nodes)}")
 
-# Create AGVs
 num_agv = AGV_NUMBR
 for i in range(num_agv):
     agv = AGV(name=f"AGV_{i + 1}", agv_id=i + 1)
@@ -1729,15 +1904,13 @@ for i in range(num_agv):
     available_agvs.append(agv)
     warehouse_system.register_agv(agv)
 
-# Create dispatcher
 dispatcher = Dispatcher(name="Dispatcher")
 warehouse_system.register_dispatcher(dispatcher)
 
-# Create order generator
 order_definitions = generate_orders_ahead(SEED, SIM_DURATION, warehouse_items)
 order_feeder = OrderFeeder(name="OrderFeeder", order_definitions=order_definitions)
+deadlock_monitor = DeadlockMonitor(name="DeadlockMonitor")
 
-# Run simulation
 SimLogger.log(f"Starting enhanced simulation with innovation mode {'ON' if INNOVATION else 'OFF'}")
 SimLogger.log("AGVs will now show live movement with color coding:")
 SimLogger.log("- Green: Idle AGVs")
@@ -1745,33 +1918,26 @@ SimLogger.log("- Orange: Moving/Queued AGVs")
 SimLogger.log("- Red: AGVs actively picking up at ASRS")
 SimLogger.log("- Blue: AGVs charging")
 
-# Start recording video
-VIDEO_DURATION = 3600*2  # 60*x minutes of simulation time (120 seconds of video at speed=30 pr hour)
+VIDEO_DURATION = 3600 * 2  # 2 hours of simulation time
 env.video("warehouse_simulation.mp4")
 
 env.run(till=VIDEO_DURATION)
 
-# Stop recording and save video
 env.video_close()
 print("Video saved to warehouse_simulation.mp4")
 
-# Print final statistics
 env.stats.print_stats()
 
-# Print additional node-based statistics
 print(f"\nNode-based Navigation Summary:")
 print(f"Total unique pickup nodes: {len(unique_nodes)}")
 if agv_list:
     avg_distance_per_agv = sum(agv.total_distance for agv in agv_list) / len(agv_list)
     print(f"Average distance per AGV: {avg_distance_per_agv:.2f} meters")
 
-# Summary of total orders and total items
 total_orders = len(all_orders)
 total_items = sum(len(order.items) for order in all_orders)
 
-print(f"\n Summary:")
+print(f"\nSummary:")
 print(f"Total orders created: {total_orders}")
 print(f"Total items across all orders: {total_items}")
 print(f"Average items per order: {total_items / total_orders:.2f}" if total_orders > 0 else "No orders created.")
-
-
