@@ -13,7 +13,8 @@ Specifically, it evaluates two picking workflows:
 
 ## Simulation Walkthrough Video
 
-- **Animation Recording:** [Watch the warehouse simulation (`media/warehouse_animation.mp4`)](media/warehouse_animation.mp4)
+- **Animation Recording:**
+- [[Watch the warehouse simulation (`media/warehouse_animation.mp4`)](media/warehouse_animation.mp4)](https://github.com/user-attachments/assets/05a7f8ed-ecd4-45b7-b339-8df41408c3c5)
 
 *(Place your compressed file at `media/warehouse_animation.mp4` in the repository so visitors can view or download it directly from the README.)*
 
